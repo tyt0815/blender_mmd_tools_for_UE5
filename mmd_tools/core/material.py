@@ -169,15 +169,8 @@ class FnMaterial:
     def update_toon_texture(self):
         if self._nodes_are_readonly:
             return
-        mmd_mat: MMDMaterial = self.__material.mmd_material
-        if mmd_mat.is_shared_toon_texture:
-            shared_toon_folder = FnContext.get_addon_preferences_attribute(FnContext.ensure_context(), "shared_toon_folder", "")
-            toon_path = os.path.join(shared_toon_folder, f"toon{mmd_mat.shared_toon_texture + 1:02d}.bmp")
-            self.create_toon_texture(str(Path(toon_path).resolve()))
-        elif mmd_mat.toon_texture != "":
-            self.create_toon_texture(mmd_mat.toon_texture)
-        else:
-            self.remove_toon_texture()
+        # Do not create toon texture node - just remove if exists
+        self.remove_toon_texture()
 
     def _mix_diffuse_and_ambient(self, mmd_mat):
         r, g, b = mmd_mat.diffuse_color
@@ -323,7 +316,12 @@ class FnMaterial:
             # pylint: disable=assignment-from-no-return
             texture.label = bpy.path.display_name(node_name)
             texture.name = node_name
-            texture.location = nodes["mmd_shader"].location + Vector((pos[0] * 210, pos[1] * 220))
+            # Use Principled BSDF location instead of mmd_shader
+            node_bsdf = nodes.get("Principled BSDF", None)
+            if node_bsdf:
+                texture.location = node_bsdf.location + Vector((pos[0] * 210, pos[1] * 220))
+            else:
+                texture.location = (pos[0] * 210, pos[1] * 220)
         texture.image = self._load_image(filepath)
         self.__update_shader_nodes()
         return texture
@@ -515,67 +513,35 @@ class FnMaterial:
 
         nodes, links = mat.node_tree.nodes, mat.node_tree.links
 
-        class _Dummy:
-            default_value, is_linked = None, True
+        # Create Principled BSDF node
+        node_bsdf = nodes.get("Principled BSDF", None)
+        if node_bsdf is None:
+            node_bsdf = nodes.new("ShaderNodeBsdfPrincipled")
+            node_bsdf.name = "Principled BSDF"
+            node_bsdf.location = (0, 0)
 
-        node_shader = nodes.get("mmd_shader", None)
-        if node_shader is None:
-            node_shader: bpy.types.ShaderNodeGroup = nodes.new("ShaderNodeGroup")
-            node_shader.name = "mmd_shader"
-            node_shader.location = (0, 300)
-            node_shader.width = 200
-            node_shader.node_tree = self.__get_shader()
+        # Create Material Output node
+        node_output = next((n for n in nodes if isinstance(n, bpy.types.ShaderNodeOutputMaterial) and n.is_active_output), None)
+        if node_output is None:
+            node_output = nodes.new("ShaderNodeOutputMaterial")
+            node_output.is_active_output = True
+        node_output.location = node_bsdf.location + Vector((400, 0))
 
-            mmd_mat: MMDMaterial = mat.mmd_material
-            node_shader.inputs.get("Ambient Color", _Dummy).default_value = mmd_mat.ambient_color[:] + (1,)
-            node_shader.inputs.get("Diffuse Color", _Dummy).default_value = mmd_mat.diffuse_color[:] + (1,)
-            node_shader.inputs.get("Specular Color", _Dummy).default_value = mmd_mat.specular_color[:] + (1,)
-            node_shader.inputs.get("Reflect", _Dummy).default_value = mmd_mat.shininess
-            node_shader.inputs.get("Alpha", _Dummy).default_value = mmd_mat.alpha
-            node_shader.inputs.get("Double Sided", _Dummy).default_value = mmd_mat.is_double_sided
-            node_shader.inputs.get("Self Shadow", _Dummy).default_value = mmd_mat.enabled_self_shadow
-            self.update_sphere_texture_type()
+        # Connect Principled BSDF to Material Output
+        if not node_output.inputs["Surface"].is_linked:
+            links.new(node_bsdf.outputs["BSDF"], node_output.inputs["Surface"])
 
-        node_uv = nodes.get("mmd_tex_uv", None)
-        if node_uv is None:
-            node_uv: bpy.types.ShaderNodeGroup = nodes.new("ShaderNodeGroup")
-            node_uv.name = "mmd_tex_uv"
-            node_uv.location = node_shader.location + Vector((-5 * 210, -2.5 * 220))
-            node_uv.node_tree = self.__get_shader_uv()
-
-        shader_out_socket = node_shader.outputs.get("Shader")
-        color_out_socket = node_shader.outputs.get("Color")
-        alpha_out_socket = node_shader.outputs.get("Alpha")
-        shader_linked = shader_out_socket and shader_out_socket.is_linked
-        color_linked = color_out_socket and color_out_socket.is_linked
-        alpha_linked = alpha_out_socket and alpha_out_socket.is_linked
-        if not (shader_linked or color_linked or alpha_linked):
-            node_output = next((n for n in nodes if isinstance(n, bpy.types.ShaderNodeOutputMaterial) and n.is_active_output), None)
-            if node_output is None:
-                node_output: bpy.types.ShaderNodeOutputMaterial = nodes.new("ShaderNodeOutputMaterial")
-                node_output.is_active_output = True
-            node_output.location = node_shader.location + Vector((400, 0))
-            if shader_out_socket:
-                links.new(shader_out_socket, node_output.inputs["Surface"])
-            elif color_out_socket:
-                logging.info("Material '%s': MMDShaderDev node group is missing 'Shader' output. Falling back to 'Color' output. Material will render as an emission shader.", mat.name)
-                links.new(color_out_socket, node_output.inputs["Surface"])
-            elif alpha_out_socket:
-                logging.warning("Material '%s': MMDShaderDev node group is missing 'Shader' and 'Color' outputs. Falling back to 'Alpha' output. Material will render as grayscale.", mat.name)
-                links.new(alpha_out_socket, node_output.inputs["Surface"])
-            else:
-                raise RuntimeError(f"Material '{mat.name}': The 'mmd_shader' node group is invalid or corrupted. It is missing all expected outputs ('Shader', 'Color', and 'Alpha'). Unable to link material output.")
-
-        for name_id in ("Base", "Toon", "Sphere"):
-            texture = self.__get_texture_node(f"mmd_{name_id.lower()}_tex")
-            if texture:
-                name_tex_in, name_alpha_in, name_uv_out = (name_id + x for x in (" Tex", " Alpha", " UV"))
-                if not node_shader.inputs.get(name_tex_in, _Dummy).is_linked:
-                    links.new(texture.outputs["Color"], node_shader.inputs[name_tex_in])
-                if not node_shader.inputs.get(name_alpha_in, _Dummy).is_linked:
-                    links.new(texture.outputs["Alpha"], node_shader.inputs[name_alpha_in])
-                if not texture.inputs["Vector"].is_linked:
-                    links.new(node_uv.outputs[name_uv_out], texture.inputs["Vector"])
+        # Connect Base Texture to Principled BSDF
+        texture_base = self.__get_texture_node("mmd_base_tex")
+        if texture_base:
+            texture_base.location = node_bsdf.location + Vector((-400, 0))
+            # Remove existing connection to Base Color if any, then connect texture Color to Principled BSDF Base Color
+            if node_bsdf.inputs["Base Color"].is_linked:
+                links.remove(node_bsdf.inputs["Base Color"].links[0])
+            links.new(texture_base.outputs["Color"], node_bsdf.inputs["Base Color"])
+            # Connect texture UV coordinates
+            if texture_base.inputs["Vector"].is_linked:
+                links.remove(texture_base.inputs["Vector"].links[0])
 
     def __get_shader_uv(self):
         group_name = "MMDTexUV"
