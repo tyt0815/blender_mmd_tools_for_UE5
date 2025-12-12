@@ -2,7 +2,7 @@ schema_version = "1.0.0"
 
 id = "mmd_tools"
 version = "4.5.3"
-name = "MMD Tools"
+name = "MMD Tools for UE5"
 tagline = "Utility tools for MMD model editing"
 maintainer = "UuuNyaa <uuunyaa@gmail.com>"
 type = "add-on"
